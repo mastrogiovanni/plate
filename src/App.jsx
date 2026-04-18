@@ -13,11 +13,19 @@ function savePlates(plates) {
 
 // ── Claude API ───────────────────────────────────────────────────────────────
 async function recognizePlate(base64Image) {
+  const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error("API key not found");
+  }
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { 
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-3-5-sonnet-20241022",
       max_tokens: 1000,
       messages: [{
         role: "user",
@@ -38,6 +46,9 @@ Non aggiungere testo fuori dal JSON.`,
       }],
     }),
   });
+  if (!response.ok) {
+    throw new Error(`API error: ${response.status}`);
+  }
   const data = await response.json();
   const text = data.content?.map((c) => c.text || "").join("") || "";
   try {
