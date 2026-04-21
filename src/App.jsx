@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import * as ort from "onnxruntime-web";
 
 // ── Storage helpers ──────────────────────────────────────────────────────────
 const STORAGE_KEY = "comprensorio_targhe";
@@ -11,51 +12,77 @@ function savePlates(plates) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(plates));
 }
 
-// ── Claude API ───────────────────────────────────────────────────────────────
+// ── OCR (ONNX) ───────────────────────────────────────────────────────────────
+const CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+let _session = null;
+
+async function getSession() {
+  if (!_session) {
+    _session = await ort.InferenceSession.create("/models/cct_ocr.onnx");
+  }
+  return _session;
+}
+
+function preprocessCanvas(sourceCanvas, width = 160, height = 32) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(sourceCanvas, 0, 0, width, height);
+  const { data } = ctx.getImageData(0, 0, width, height);
+  const input = new Float32Array(width * height);
+  for (let i = 0; i < width * height; i++) {
+    input[i] = (data[i * 4] + data[i * 4 + 1] + data[i * 4 + 2]) / 3 / 255.0;
+  }
+  return new ort.Tensor("float32", input, [1, 1, height, width]);
+}
+
+function ctcDecode(output) {
+  const seq = output.data;
+  const vocabSize = CHARS.length;
+  const steps = seq.length / vocabSize;
+  let result = "";
+  let prev = -1;
+  for (let i = 0; i < steps; i++) {
+    let maxIdx = 0;
+    let maxVal = -Infinity;
+    for (let j = 0; j < vocabSize; j++) {
+      const val = seq[i * vocabSize + j];
+      if (val > maxVal) { maxVal = val; maxIdx = j; }
+    }
+    if (maxIdx !== prev) {
+      result += CHARS[maxIdx] ?? "";
+      prev = maxIdx;
+    }
+  }
+  return result.trim();
+}
+
 async function recognizePlate(base64Image) {
-  const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    throw new Error("API key not found");
-  }
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { 
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01"
-    },
-    body: JSON.stringify({
-      model: "claude-3-5-sonnet-20241022",
-      max_tokens: 1000,
-      messages: [{
-        role: "user",
-        content: [
-          {
-            type: "image",
-            source: { type: "base64", media_type: "image/jpeg", data: base64Image },
-          },
-          {
-            type: "text",
-            text: `Analizza questa immagine e trova tutte le targhe di veicoli visibili.
-Per ogni targa trovata rispondi SOLO con un oggetto JSON valido in questo formato esatto:
-{"plates":["AB123CD","EF456GH"],"confidence":"alta|media|bassa","note":"eventuale nota breve"}
-Se non vedi nessuna targa: {"plates":[],"confidence":"alta","note":"Nessuna targa rilevata"}
-Non aggiungere testo fuori dal JSON.`,
-          },
-        ],
-      }],
-    }),
+  const session = await getSession();
+
+  // Decode base64 into an ImageBitmap via a canvas
+  const img = await new Promise((resolve, reject) => {
+    const i = new Image();
+    i.onload = () => resolve(i);
+    i.onerror = reject;
+    i.src = "data:image/jpeg;base64," + base64Image;
   });
-  if (!response.ok) {
-    throw new Error(`API error: ${response.status}`);
+
+  const srcCanvas = document.createElement("canvas");
+  srcCanvas.width = img.naturalWidth;
+  srcCanvas.height = img.naturalHeight;
+  srcCanvas.getContext("2d").drawImage(img, 0, 0);
+
+  const inputTensor = preprocessCanvas(srcCanvas);
+  const results = await session.run({ input: inputTensor });
+  const outputKey = Object.keys(results)[0];
+  const plate = ctcDecode(results[outputKey]);
+
+  if (!plate || plate.length < 4) {
+    return { plates: [], confidence: "bassa", note: "Nessuna targa rilevata" };
   }
-  const data = await response.json();
-  const text = data.content?.map((c) => c.text || "").join("") || "";
-  try {
-    return JSON.parse(text.replace(/```json|```/g, "").trim());
-  } catch {
-    return { plates: [], confidence: "bassa", note: "Errore parsing risposta AI" };
-  }
+  return { plates: [plate], confidence: "alta", note: "" };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -163,7 +190,7 @@ export default function App() {
         showToast("Nessuna targa trovata nell'immagine", "warn");
       }
     } catch {
-      showToast("Errore durante l'analisi AI", "err");
+      showToast("Errore durante l'analisi OCR", "err");
     } finally {
       setAnalyzing(false);
       setCapturing(false);
@@ -299,7 +326,7 @@ export default function App() {
                     disabled={analyzing || capturing}
                   >
                     {analyzing
-                      ? <><span style={S.spin}>◌</span> &nbsp;ANALISI AI...</>
+                      ? <><span style={S.spin}>◌</span> &nbsp;ANALISI OCR...</>
                       : "◉ &nbsp;SCATTA E ANALIZZA"}
                   </button>
                 </>
